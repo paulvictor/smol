@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedLists #-}
 module Data.Smol
-  ( lookupEncodedSmol
+  ( lookupEncodedHamt
   , trimHAMT
   , serializeHAMT
   , lookupHAMT
@@ -8,7 +8,8 @@ module Data.Smol
   , LeafElem(..)
   , HAMT(..)
   , Smol(..)
-  , fromKV ) where
+  , withEncodedSmol
+  , fromKVPairs ) where
 
 import Data.Word
 import Data.Serialize
@@ -68,6 +69,12 @@ data LeafElem k v =
   } deriving (Eq, Show, Functor, Foldable, Traversable)
 $(makeLenses ''LeafElem)
 
+instance (Serialize k, Serialize v) => Serialize (LeafElem k v) where
+  put (LeafElem {_k, _v}) =
+    putTwoOf varLengthEncoded varLengthEncoded (_k, _v)
+  get =
+    uncurry LeafElem <$> getTwoOf getLengthEncoded getLengthEncoded
+
 data HAMT k v
   = Internal
     {
@@ -103,14 +110,8 @@ trimHAMT = \case
       then firstTrimmed
       else nodeWithTrimmedChildren
 
-instance (Serialize k, Serialize v) => Serialize (LeafElem k v) where
-  put (LeafElem {_k, _v}) =
-    putTwoOf varLengthEncoded varLengthEncoded (_k, _v)
-  get =
-    uncurry LeafElem <$> getTwoOf getLengthEncoded getLengthEncoded
-
-fromKV :: (Foldable t, Serialize k, Serialize v, Hashable k) => t (k, v) -> HAMT k v
-fromKV = foldr (\(k, v) hamt -> consHAMT k v hamt) (empty 5)
+fromKVPairs :: (Foldable t, Serialize k, Serialize v, Hashable k) => t (k, v) -> HAMT k v
+fromKVPairs = foldr (\(k, v) hamt -> consHAMT k v hamt) (empty 5)
 
 empty :: Int -> HAMT k v
 empty level =
@@ -192,21 +193,21 @@ lookupHAMT key root = go 5 root
       positionInOrderedChildren = popCountToRightOf idxIntoBitmap _bitmap
 
 --Smol and friends
-newtype Smol (version :: Nat) = Smol { _unSmol :: ByteString } deriving (Eq, Ord)
+newtype Smol (version :: Nat) = Smol { _unSmol :: ByteString } deriving (Eq, Ord, Show)
 
 instance Serialize (Smol 1) where
   get = do
-    !identifier <- getBytes 4
+    identifier <- getBytes 4
     guard (identifier == "SMOL")
-    !version <- getWord8
+    version <- getWord8
     guard (toInteger version == 1)
     -- Right now only Version 1
     Smol <$> getLengthEncodedBS
 
-  put (Smol bs)= do
-    putByteString "SMOL"
-    putWord8 1
-    varLengthEncoded bs
+  put (Smol bs) =
+    putByteString "SMOL" >>
+    putWord8 1 >>
+    putLengthEncodedBS bs
 
 --Serialize all children and get the bytestrings. Calculate the length of each, and adjust offsets
 -- This serialize/deserializeHAMT is not considering headers
@@ -225,12 +226,23 @@ serializeHAMT = Smol . go
          offsets :|> _ =
            Seq.scanl (+) 0 $
              BS.length <$> serializedChildren
+         maxOffset =
+           maximum offsets
+         (offsetsPut, !numWordsPerOffset) =
+           if maxOffset < (fromEnum (maxBound @Word8))
+           then (mapM_ (putWord8 . toEnum) offsets, 1)
+           else if maxOffset < (fromEnum (maxBound @Word16))
+           then (mapM_ (putWord16be . toEnum) offsets, 2)
+           else if maxOffset < (fromEnum (maxBound @Word32))
+           then (mapM_ (putWord32be . toEnum) offsets, 4)
+           else (mapM_ (putWord64be . toEnum) offsets, 8)
        in runPut $
             put (0 :: Word8) >>
             putNested
               (putWord16be . toEnum)
               (put _bitmap >>
-               mapM_ (putWord16be . toEnum) offsets) >>
+               putWord8 numWordsPerOffset >>
+               offsetsPut) >>
             mapM_ putByteString serializedChildren
 
 deserializeHAMT :: (Serialize k, Serialize v) => Smol 1 -> Either String [(k, v)]
@@ -245,18 +257,22 @@ getKVs =
         size <- fromEnum <$> getWord16be
         -- This size is inclusive of the bitmap which is 8 bytes long.
         skip (sizeOf (undefined :: Word64))
+        sizeOfOffset <- fromEnum <$> getWord8
         let
           numOffsets =
-            (size - (sizeOf (undefined :: Word64))) `div` (sizeOf (undefined :: Word16))
-        replicateM numOffsets getWord16be
+            (size - (sizeOf (undefined :: Word64) + (sizeOf (undefined :: Word8)))) `div` sizeOfOffset
+        replicateM numOffsets (getFromSize sizeOfOffset)
       fmap concat $ for offsets $ \offset -> lookAhead $ do
         getWord16be >>= skip . fromEnum
-        skip (fromEnum offset) >> getKVs
+        skip offset >> getKVs
     _ -> fail "Expected 0 or 1"
 
-lookupEncodedSmol :: (Eq k, Hashable k, Serialize v, Serialize k) => k -> ByteString -> Either String (Maybe v)
-lookupEncodedSmol key =
-  runGet (get @(Smol 1)) >=> runGet (go 5) . _unSmol
+withEncodedSmol :: Get a -> ByteString -> Either String a
+withEncodedSmol g = decode @(Smol 1) >=> runGet g . _unSmol
+
+lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> ByteString -> Either String (Maybe v)
+lookupEncodedHamt key =
+  runGet (go 5)
   where
   !h = lookupHash key
   go !currentLevel = getWord8 >>= \case
@@ -267,20 +283,32 @@ lookupEncodedSmol key =
         nextLevel = currentLevel - 1
         idxIntoBitmap = idxIntoBitmapForPos currentLevel h
         getOffset = do
-          skip (sizeOf (undefined :: Word16))
+          skip (sizeOf (undefined :: Word16)) -- The size of this block
           !bm <- get
+          !sizeOfOffset <- fromEnum <$> getWord8
           let
             isChildPresent = checkBit bm idxIntoBitmap
             offset = popCountToRightOf idxIntoBitmap bm
           if isChildPresent
           then -- get the offset
-            skip (offset * sizeOf (undefined :: Word16)) >>
-            Just <$> getWord16be
+            skip (offset * sizeOfOffset) >>
+            Just <$> getFromSize sizeOfOffset
           else return Nothing
       in lookAhead getOffset >>=
         maybe
           (return Nothing)
-          (\offset -> do
-            getWord16be >>= skip . fromEnum
+          (\(!offset) -> do
+            getWord16be >>= skip . fromEnum -- Skip this block
             skip (fromEnum offset) >> go nextLevel)
     _ -> fail "Cannot match a leaf or an internal node"
+
+{-# INLINE getFromSize #-}
+getFromSize :: Int -> Get Int
+getFromSize sizeOfOffset =
+  if sizeOfOffset == 1
+  then getWord8 <&> fromEnum
+  else if sizeOfOffset == 2
+  then getWord16be <&> fromEnum
+  else if sizeOfOffset == 4
+  then getWord32be <&> fromEnum
+  else getWord64be <&> fromEnum
