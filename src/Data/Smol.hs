@@ -8,9 +8,10 @@ module Data.Smol
   , LeafElem(..)
   , HAMT(..)
   , Smol(..)
-  , withEncodedSmol
   , fromKVPairs ) where
 
+import Control.Monad.Trans.Class
+import Data.Semigroup
 import Data.Word
 import Data.Serialize
 import Control.Lens.Operators
@@ -20,6 +21,9 @@ import Data.Bits
 import Data.Hashable
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as LBS
+import qualified Data.ByteString.Builder as B
+import Data.ByteString.Builder (Builder)
 import Data.Sequence (Seq(..))
 import qualified Data.Sequence as Seq
 import Data.VarLength
@@ -29,6 +33,8 @@ import Foreign.Storable (sizeOf)
 import Data.Tree (drawTree, Tree(..))
 import GHC.TypeLits
 import Control.Monad
+import qualified Control.Monad.Trans.State.Strict as State
+import Control.Monad.Trans.State.Strict (StateT, runStateT, State, runState)
 
 -- bitmap is a vector of 256 bits
 newtype Bitmap = Bitmap { _unBitmap :: Word64 } deriving (Eq)
@@ -193,91 +199,96 @@ lookupHAMT key root = go 5 root
       positionInOrderedChildren = popCountToRightOf idxIntoBitmap _bitmap
 
 --Smol and friends
-newtype Smol (version :: Nat) = Smol { _unSmol :: ByteString } deriving (Eq, Ord, Show)
+data Smol (version :: Nat) = Smol
+  { _lookupBuffer :: ByteString
+  , _leavesCount :: Word32
+  , _leavesBuffer :: ByteString }
 
-instance Serialize (Smol 1) where
-  get = do
-    identifier <- getBytes 4
-    guard (identifier == "SMOL")
-    version <- getWord8
-    guard (toInteger version == 1)
-    -- Right now only Version 1
-    Smol <$> getLengthEncodedBS
+$(makeLenses ''Smol)
 
-  put (Smol bs) =
-    putByteString "SMOL" >>
-    putWord8 1 >>
-    putLengthEncodedBS bs
+-- instance Serialize (Smol 1) where
+--   get = do
+--     identifier <- getBytes 4
+--     guard (identifier == "SMOL")
+--     version <- getWord8
+--     guard (toInteger version == 1)
+--     -- Right now only Version 1
+--     Smol <$> getLengthEncodedBS
+
+--   put (Smol bs) =
+--     putByteString "SMOL" >>
+--     putWord8 1 >>
+--     putLengthEncodedBS bs
+
+data S = S
+  { _leavesBuilder :: Builder
+  , _count :: Word32 -- Count is useful for deserializeHAMT to find number of leaves
+  , _offset :: Int }
+$(makeLenses ''S)
 
 --Serialize all children and get the bytestrings. Calculate the length of each, and adjust offsets
 -- This serialize/deserializeHAMT is not considering headers
-serializeHAMT :: (Serialize k, Serialize v) => HAMT k v -> Smol 1
-serializeHAMT = Smol . go
+
+serializeHAMT :: forall k v. (Serialize k, Serialize v) => HAMT k v -> Smol 1
+serializeHAMT hamt =
+  let
+    (_lookupBuffer, S{..}) = runState (go hamt) (S mempty 0 0)
+  in
+    Smol {_lookupBuffer, _leavesBuffer = LBS.toStrict $ B.toLazyByteString _leavesBuilder, _leavesCount = _count}
   where
+  go :: HAMT k v -> State S ByteString
   go = \case
-     node@(Leaf _) ->
-       runPut $
-         put (1 :: Word8) >>
-         putListOf put (node ^. values)
-     node@(Internal {..}) ->
-       let
-         serializedChildren =
-           go <$> node ^. orderedChildren
-         offsets :|> _ =
-           Seq.scanl (+) 0 $
-             BS.length <$> serializedChildren
-         maxOffset =
-           maximum offsets
-         (offsetsPut, !numWordsPerOffset) =
-           if maxOffset < (fromEnum (maxBound @Word8))
-           then (mapM_ (putWord8 . toEnum) offsets, 1)
-           else if maxOffset < (fromEnum (maxBound @Word16))
-           then (mapM_ (putWord16be . toEnum) offsets, 2)
-           else if maxOffset < (fromEnum (maxBound @Word32))
-           then (mapM_ (putWord32be . toEnum) offsets, 4)
-           else (mapM_ (putWord64be . toEnum) offsets, 8)
-       in runPut $
-            put (0 :: Word8) >>
+    node@(Leaf _) -> do
+      o <- use offset
+      let
+        serializedLeaf = runPut $
+          putWord8 1 >> putWord32be (fromIntegral o)
+        lbs = runPutLazy $ putListOf put (node ^. values)
+        l = LBS.length lbs
+      leavesBuilder <>= B.lazyByteString lbs
+      count += 1
+      offset += fromIntegral l
+      return serializedLeaf
+    node@(Internal {..}) -> do
+      serializedChildren <- for (node ^. orderedChildren) go
+      let
+        offsets :|> _ =
+          Seq.scanl (+) 0 $
+            BS.length <$> serializedChildren
+        serializedNode = runPut $
+          put (0 :: Word8) >>
             putNested
               (putWord16be . toEnum)
               (put _bitmap >>
-               putWord8 numWordsPerOffset >>
-               offsetsPut) >>
+               for_ offsets (putWord32be . fromIntegral)) >>
             mapM_ putByteString serializedChildren
+      return serializedNode
 
-deserializeHAMT :: (Serialize k, Serialize v) => Smol 1 -> Either String [(k, v)]
-deserializeHAMT (Smol bs) = runGet getKVs bs <&> fmap (\(LeafElem {..}) -> (_k, _v))
+deserializeHAMT :: forall k v. (Serialize k, Serialize v) => Smol 1 -> Either String [(k, v)]
+deserializeHAMT (Smol {_leavesCount, _leavesBuffer}) =
+  runGet
+    (replicateM (fromIntegral _leavesCount) (getListOf get :: Get [LeafElem k v]))
+    _leavesBuffer
+  <&> concat
+  <&> fmap (\(LeafElem k v)  -> (k, v))
 
-getKVs :: (Serialize k, Serialize v) => Get [LeafElem k v]
-getKVs =
-  getWord8 >>= \case
-    1 -> getListOf get
-    0 -> do
-      offsets <- lookAhead $ do
-        size <- fromEnum <$> getWord16be
-        -- This size is inclusive of the bitmap which is 8 bytes long.
-        skip (sizeOf (undefined :: Word64))
-        sizeOfOffset <- fromEnum <$> getWord8
-        let
-          numOffsets =
-            (size - (sizeOf (undefined :: Word64) + (sizeOf (undefined :: Word8)))) `div` sizeOfOffset
-        replicateM numOffsets (getFromSize sizeOfOffset)
-      fmap concat $ for offsets $ \offset -> lookAhead $ do
-        getWord16be >>= skip . fromEnum
-        skip offset >> getKVs
-    _ -> fail "Expected 0 or 1"
+lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> Smol 1 -> Either String (Maybe v)
+lookupEncodedHamt key smol = do
+  maybeOffset <- runGet (go 5) (smol ^. lookupBuffer)
+  maybe
+    (return Nothing)
+    (\o -> getValueFromLeafAtOffset o)
+    maybeOffset
 
-withEncodedSmol :: Get a -> ByteString -> Either String a
-withEncodedSmol g = decode @(Smol 1) >=> runGet g . _unSmol
-
-lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> ByteString -> Either String (Maybe v)
-lookupEncodedHamt key =
-  runGet (go 5)
   where
   !h = lookupHash key
+  findInLeaves o =
+    skip (fromIntegral o) >>
+    fmap _v . find (has (k.only key)) <$> getListOf get
+  getValueFromLeafAtOffset o = runGet (findInLeaves o) (smol ^. leavesBuffer)
   go !currentLevel = getWord8 >>= \case
     1 ->
-      fmap _v . find (has (k.only key)) <$> getListOf get -- laziness will help to not materialize the whole seq?
+       getWord32be <&> Just
     0 ->
       let
         nextLevel = currentLevel - 1
