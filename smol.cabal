@@ -108,6 +108,11 @@ executable json-to-smol
                -funbox-strict-fields
                -fmax-worker-args=64
                -fno-ignore-asserts
+--                -prof
+--                -fprof-auto
+--                -fprof-auto-top
+               -rtsopts
+               -threaded
 
   main-is: Main.hs
   build-depends: base
