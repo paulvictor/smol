@@ -44,8 +44,8 @@ lookup_ keys =
   runConduit $
     stdin
     .| Zstd.decompress
-    .| conduitGet2 (get @(Smol 1))
-    .| C.map ((\bs -> KM.fromList (keys <&> (\key -> (key, join $ hush (lookupEncodedHamt @Key @Value key bs))))) . _unSmol)
+    .| conduitGet2 get
+    .| C.map (\smol1 -> KM.fromList (keys <&> (\key -> (key, join $ hush (lookupEncodedHamt @Key @Value key smol1)))))
     .| C.map encode
     .| C.mapM_ (LBS.putStrLn)
 

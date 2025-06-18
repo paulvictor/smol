@@ -200,25 +200,29 @@ lookupHAMT key root = go 5 root
 
 --Smol and friends
 data Smol (version :: Nat) = Smol
-  { _lookupBuffer :: ByteString
+  { _lookupBuffer :: !ByteString
   , _leavesCount :: Word32
   , _leavesBuffer :: ByteString }
 
 $(makeLenses ''Smol)
 
--- instance Serialize (Smol 1) where
---   get = do
---     identifier <- getBytes 4
---     guard (identifier == "SMOL")
---     version <- getWord8
---     guard (toInteger version == 1)
---     -- Right now only Version 1
---     Smol <$> getLengthEncodedBS
+instance Serialize (Smol 1) where
+  get = do
+    identifier <- getBytes 4
+    guard (identifier == "SMOL")
+    version <- getWord8
+    guard (toInteger version == 1) -- Right now only Version 1
+    _lookupBuffer <- getLengthEncodedBS
+    _leavesCount <- getWord32be
+    _leavesBuffer <- getLengthEncodedBS
+    return $! Smol {_lookupBuffer, _leavesCount, _leavesBuffer}
 
---   put (Smol bs) =
---     putByteString "SMOL" >>
---     putWord8 1 >>
---     putLengthEncodedBS bs
+  put (Smol {..}) =
+    putByteString "SMOL" >>
+    putWord8 1 >>
+    putLengthEncodedBS _lookupBuffer >>
+    putWord32be _leavesCount >>
+    putLengthEncodedBS _leavesBuffer
 
 data S = S
   { _leavesBuilder :: Builder
@@ -231,12 +235,13 @@ $(makeLenses ''S)
 
 serializeHAMT :: forall k v. (Serialize k, Serialize v) => HAMT k v -> Smol 1
 serializeHAMT hamt =
-  let
-    (_lookupBuffer, S{..}) = runState (go hamt) (S mempty 0 0)
-  in
-    Smol {_lookupBuffer, _leavesBuffer = LBS.toStrict $ B.toLazyByteString _leavesBuilder, _leavesCount = _count}
+  Smol
+    { _lookupBuffer
+    , _leavesBuffer = LBS.toStrict $ B.toLazyByteString _leavesBuilder
+    , _leavesCount = _count }
   where
-  go :: HAMT k v -> State S ByteString
+  (_lookupBuffer, S{..}) =
+    runState (go hamt) (S mempty 0 0)
   go = \case
     node@(Leaf _) -> do
       o <- use offset
@@ -273,18 +278,18 @@ deserializeHAMT (Smol {_leavesCount, _leavesBuffer}) =
   <&> fmap (\(LeafElem k v)  -> (k, v))
 
 lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> Smol 1 -> Either String (Maybe v)
-lookupEncodedHamt key smol = do
-  maybeOffset <- runGet (go 5) (smol ^. lookupBuffer)
-  maybe
-    (return Nothing)
-    (\o -> getValueFromLeafAtOffset o)
-    maybeOffset
-
+lookupEncodedHamt key smol =
+  runGet (go 5) (smol ^. lookupBuffer) >>=
+    maybe
+      (return Nothing)
+      getValueFromLeafAtOffset
   where
   !h = lookupHash key
+  {-# INLINE findInLeaves #-}
   findInLeaves o =
     skip (fromIntegral o) >>
     fmap _v . find (has (k.only key)) <$> getListOf get
+  {-# INLINE getValueFromLeafAtOffset #-}
   getValueFromLeafAtOffset o = runGet (findInLeaves o) (smol ^. leavesBuffer)
   go !currentLevel = getWord8 >>= \case
     1 ->
@@ -294,16 +299,15 @@ lookupEncodedHamt key smol = do
         nextLevel = currentLevel - 1
         idxIntoBitmap = idxIntoBitmapForPos currentLevel h
         getOffset = do
-          skip (sizeOf (undefined :: Word16)) -- The size of this block
+          skip (sizeOf (undefined :: Word16)) -- 2 bytes indicating the size of this block
           !bm <- get
-          !sizeOfOffset <- fromEnum <$> getWord8
           let
             isChildPresent = checkBit bm idxIntoBitmap
             offset = popCountToRightOf idxIntoBitmap bm
           if isChildPresent
           then -- get the offset
-            skip (offset * sizeOfOffset) >>
-            Just <$> getFromSize sizeOfOffset
+            skip (offset * (sizeOf (undefined :: Word32))) >>
+            Just <$> getWord32be
           else return Nothing
       in lookAhead getOffset >>=
         maybe
@@ -312,14 +316,3 @@ lookupEncodedHamt key smol = do
             getWord16be >>= skip . fromEnum -- Skip this block
             skip (fromEnum offset) >> go nextLevel)
     _ -> fail "Cannot match a leaf or an internal node"
-
-{-# INLINE getFromSize #-}
-getFromSize :: Int -> Get Int
-getFromSize sizeOfOffset =
-  if sizeOfOffset == 1
-  then getWord8 <&> fromEnum
-  else if sizeOfOffset == 2
-  then getWord16be <&> fromEnum
-  else if sizeOfOffset == 4
-  then getWord32be <&> fromEnum
-  else getWord64be <&> fromEnum
