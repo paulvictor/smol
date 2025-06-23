@@ -64,16 +64,15 @@ popCountToRightOf pos (Bitmap bm) =
 data LeafElem k v =
   LeafElem
   {
-    _k :: k
+    _k :: !k
   , _v :: v
   } deriving (Eq, Show, Functor, Foldable, Traversable)
 $(makeLenses ''LeafElem)
 
 instance (Serialize k, Serialize v) => Serialize (LeafElem k v) where
-  put (LeafElem {_k, _v}) =
-    putTwoOf varLengthEncoded varLengthEncoded (_k, _v)
-  get =
-    uncurry LeafElem <$> getTwoOf getLengthEncoded getLengthEncoded
+  put (LeafElem {_k, _v}) = put _k >> put _v
+  {-# INLINE get #-}
+  get = LeafElem <$> get <*> get
 
 data HAMT k v
   = Internal
@@ -197,12 +196,13 @@ newtype Smol (version :: Nat) = Smol { _unSmol :: ByteString } deriving (Eq, Ord
 
 instance Serialize (Smol 1) where
   get = do
-    identifier <- getBytes 4
+    !identifier <- getBytes 4
     guard (identifier == "SMOL")
-    version <- getWord8
+    !version <- getWord8
     guard (toInteger version == 1)
     -- Right now only Version 1
-    Smol <$> getLengthEncodedBS
+    !bs <- getLengthEncodedBS
+    return $! Smol bs
 
   put (Smol bs) =
     putByteString "SMOL" >>
@@ -218,7 +218,7 @@ serializeHAMT = Smol . go
      node@(Leaf _) ->
        runPut $
          put (1 :: Word8) >>
-         putListOf put (node ^. values)
+         putListOf' put (node ^. values)
      node@(Internal {..}) ->
        let
          serializedChildren =
@@ -251,55 +251,57 @@ deserializeHAMT (Smol bs) = runGet getKVs bs <&> fmap (\(LeafElem {..}) -> (_k, 
 getKVs :: (Serialize k, Serialize v) => Get [LeafElem k v]
 getKVs =
   getWord8 >>= \case
-    1 -> getListOf get
+    1 -> getListOf' get
     0 -> do
       offsets <- lookAhead $ do
         size <- fromEnum <$> getWord16be
         -- This size is inclusive of the bitmap which is 8 bytes long.
-        skip (sizeOf (undefined :: Word64))
+        uncheckedSkip (sizeOf (undefined :: Word64))
         sizeOfOffset <- fromEnum <$> getWord8
         let
           numOffsets =
             (size - (sizeOf (undefined :: Word64) + (sizeOf (undefined :: Word8)))) `div` sizeOfOffset
         replicateM numOffsets (getFromSize sizeOfOffset)
       fmap concat $ for offsets $ \offset -> lookAhead $ do
-        getWord16be >>= skip . fromEnum
-        skip offset >> getKVs
+        getWord16be >>= uncheckedSkip . fromEnum
+        uncheckedSkip offset >> getKVs
     _ -> fail "Expected 0 or 1"
 
 withEncodedSmol :: Get a -> ByteString -> Either String a
 withEncodedSmol g = decode @(Smol 1) >=> runGet g . _unSmol
 
+{-# INLINE lookupEncodedHamt #-}
 lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> ByteString -> Either String (Maybe v)
 lookupEncodedHamt key =
   runGet (go 5)
   where
-  !h = lookupHash key
+  h = lookupHash key
   go !currentLevel = getWord8 >>= \case
     1 ->
-      fmap _v . find (has (k.only key)) <$> getListOf get -- laziness will help to not materialize the whole seq?
+      fmap _v . find (has (k.only key)) <$> getListOf' get -- laziness will help to not materialize the whole seq? Can we write a custom function for this which looks up the value and gets the first one?
     0 ->
       let
         nextLevel = currentLevel - 1
-        idxIntoBitmap = idxIntoBitmapForPos currentLevel h
+        !idxIntoBitmap = idxIntoBitmapForPos currentLevel h
+        {-# INLINE getOffset #-}
         getOffset = do
-          skip (sizeOf (undefined :: Word16)) -- The size of this block
+          uncheckedSkip (sizeOf (undefined :: Word16)) -- The size of this block
           !bm <- get
           !sizeOfOffset <- fromEnum <$> getWord8
           let
-            isChildPresent = checkBit bm idxIntoBitmap
+            !isChildPresent = checkBit bm idxIntoBitmap
             offset = popCountToRightOf idxIntoBitmap bm
           if isChildPresent
           then -- get the offset
-            skip (offset * sizeOfOffset) >>
+            uncheckedSkip (offset * sizeOfOffset) >>
             Just <$> getFromSize sizeOfOffset
           else return Nothing
       in lookAhead getOffset >>=
         maybe
           (return Nothing)
           (\(!offset) -> do
-            getWord16be >>= skip . fromEnum -- Skip this block
-            skip (fromEnum offset) >> go nextLevel)
+            getWord16be >>= uncheckedSkip . fromEnum -- Skip this block
+            uncheckedSkip (fromEnum offset) >> go nextLevel)
     _ -> fail "Cannot match a leaf or an internal node"
 
 {-# INLINE getFromSize #-}
@@ -312,3 +314,15 @@ getFromSize sizeOfOffset =
   else if sizeOfOffset == 4
   then getWord32be <&> fromEnum
   else getWord64be <&> fromEnum
+
+{-# INLINE putListOf' #-}
+putListOf' :: Putter a -> Putter [a]
+putListOf' pa = \xs ->
+  put (_VarLength (fromIntegral $ length xs)) >>
+  mapM_ pa xs
+
+{-# INLINE getListOf' #-}
+getListOf' :: Get a -> Get [a]
+getListOf' g = do
+  !l <- fromIntegral . _unVarLength <$> getVarLength
+  replicateM l g

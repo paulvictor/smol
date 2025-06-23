@@ -63,6 +63,7 @@ library
         Data.Smol
       , Data.Smol.JSON
       , Data.VarLength
+      , Data.Get
 
     default-extensions:
         TemplateHaskell
@@ -90,6 +91,9 @@ library
       , lens-aeson
       , text
       , scientific
+      , mtl
+      , transformers
+      , tagged
 
     -- Directories containing source files.
     hs-source-dirs:   src
@@ -102,12 +106,21 @@ executable json-to-smol
                -fdicts-strict
                -fsimpl-tick-factor=10000
                -fspec-constr-recursive=64
+               -fspecialise
                -fstatic-argument-transformation
                -funbox-strict-fields
                -fmax-worker-args=64
                -fno-ignore-asserts
+               -fexpose-all-unfoldings
+               -ffloat-in
+               -threaded
+               -rtsopts
+--                -prof
+--                -fprof-auto
+--                -fprof-auto-top
 
   main-is: Main.hs
+
   build-depends: base
                , smol
                , aeson
