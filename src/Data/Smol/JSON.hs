@@ -1,6 +1,7 @@
 {-# OPTIONS_GHC -Wno-orphans #-}
 module Data.Smol.JSON where
 
+import Data.Functor
 import Data.Aeson
 import Data.Aeson.Lens
 import qualified Data.Aeson.KeyMap as KM
@@ -21,7 +22,8 @@ instance Serialize Value where
   put = \case
     Object o -> do
       putWord8 0
-      putMapOf put put (KM.toMap o)
+      put (_VarLength . fromIntegral $ KM.size o)
+      void $ KM.traverseWithKey (\k v -> put k >> put v) o
     Array v -> do
       putWord8 1
       put (_VarLength . fromIntegral $ (V'.length v))
@@ -41,7 +43,10 @@ instance Serialize Value where
       putWord8 6
 
   get = getWord8 >>= \case
-    0 -> Object . KM.fromMap <$> getMapOf get get -- TODO, can we use same serialization
+    0 -> do -- TODO, can we use same serialization
+      l <- fromEnum . _unVarLength <$> get @VarLength
+      kvs <- V'.replicateM l ((,) <$> get <*> get)
+      return $ Object $ KM.fromList (V'.toList kvs)
     1 -> do
       l <- fromEnum . _unVarLength <$> get @VarLength
       Array <$> V'.replicateM l get

@@ -1,10 +1,10 @@
 {-# LANGUAGE OverloadedLists #-}
 module Data.Smol
-  ( lookupEncodedHamt
-  , trimHAMT
+  ( -- lookupEncodedHamt
+  trimHAMT
   , serializeHAMT
   , lookupHAMT
-  , deserializeHAMT
+  --, deserializeHAMT
   , LeafElem(..)
   , HAMT(..)
   , Smol(..)
@@ -32,6 +32,8 @@ import Data.Tree (drawTree, Tree(..))
 import GHC.TypeLits
 import Control.Monad
 import Control.Monad.Trans.State.Strict (runState)
+import Data.DeSer
+import Data.Tagged
 
 -- bitmap is a vector of 256 bits
 newtype Bitmap = Bitmap { _unBitmap :: Word64 } deriving (Eq)
@@ -76,6 +78,9 @@ instance (Serialize k, Serialize v) => Serialize (LeafElem k v) where
   put (LeafElem {_k, _v}) = put _k >> put _v
   {-# INLINE get #-}
   get = LeafElem <$> get <*> get
+
+instance (DeSer k, DeSer v) => DeSer (LeafElem k v) where
+  deser = LeafElem <$> deser <*> deser
 
 data HAMT k v
   = Internal
@@ -215,9 +220,8 @@ instance Serialize (Smol 1) where
 
   put (Smol {..}) =
     putByteString "SMOL" >>
-    putWord8 1 >>
+    putWord8 1 >> -- Version
     putLengthEncodedBS _lookupBuffer >>
-    putWord32be _leavesCount >>
     putLengthEncodedBS _leavesBuffer
 
 data S = S
@@ -275,68 +279,84 @@ serializeHAMT hamt =
             mapM_ putByteString serializedChildren
       return serializedNode
 
-deserializeHAMT :: forall k v. (Serialize k, Serialize v) => Smol 1 -> Either String [(k, v)]
-deserializeHAMT (Smol {_leavesCount, _leavesBuffer}) =
-  runGet
-    (replicateM (fromIntegral _leavesCount) (getListOf' get))
-    _leavesBuffer
+-- deserializeHAMT :: forall k v. (Serialize k, Serialize v) => Smol 1 -> Either String [(k, v)]
+-- deserializeHAMT (Smol {_leavesCount, _leavesBuffer}) =
+--   runGet
+--     (replicateM (fromIntegral _leavesCount) (getListOf' get))
+--     _leavesBuffer
+--   <&> concat
+--   <&> fmap (\(LeafElem k v)  -> (k, v))
+
+deserializeHAMT :: forall k v. (DeSer k, DeSer v) => Smol 1 -> Either DeSerError [(k, v)]
+deserializeHAMT (Smol {_leavesBuffer}) =
+  runDeSer (deserManyTillEnd (deserMany @(LeafElem k v) deser)) _leavesBuffer
   <&> concat
-  <&> fmap (\(LeafElem k v)  -> (k, v))
+  <&> fmap (\(LeafElem k v) -> (k, v))
 
-{-# INLINE lookupEncodedHamt #-}
-lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> Smol 1 -> Either String (Maybe v)
-lookupEncodedHamt !key !smol =
-  runGet (go 5) (smol ^. lookupBuffer) >>=
-    maybe
-      (return Nothing)
-      getValueFromLeafAtOffset
-  where
-  h = lookupHash key
-  {-# INLINE findInLeaves #-}
-  findInLeaves o =
-    uncheckedSkip (fromIntegral o) >>
-    fmap _v . find (has (k.only key)) <$> getListOf' get
-  {-# INLINE getValueFromLeafAtOffset #-}
-  getValueFromLeafAtOffset o = runGet (findInLeaves o) (smol ^. leavesBuffer)
-  {-# INLINE go #-}
-  go !currentLevel = getWord8 >>= \case
-    1 ->
-       getVarLength <&> Just . _unVarLength
-    0 ->
-      let
-        nextLevel = currentLevel - 1
-        !idxIntoBitmap = idxIntoBitmapForPos currentLevel h
-        {-# INLINE getOffset #-}
-        getOffset = do
-          uncheckedSkip (sizeOf (undefined :: Word16)) -- 2 bytes indicating the size of this block
-          !bm <- get
-          !sizeOfOffset <- fromEnum <$> getWord8
-          let
-            isChildPresent = checkBit bm idxIntoBitmap
-            offset = popCountToRightOf idxIntoBitmap bm
-          if isChildPresent
-          then -- get the offset
-            uncheckedSkip (offset * sizeOfOffset) >>
-            Just <$> getFromSize sizeOfOffset
-          else return Nothing
-      in lookAhead getOffset >>=
-        maybe
-          (return Nothing)
-          (\(!offset) -> do
-            getWord16be >>= uncheckedSkip . fromEnum -- UncheckedSkip this block
-            uncheckedSkip (fromEnum offset) >> go nextLevel)
-    _ -> fail "Cannot match a leaf or an internal node"
+-- {-# INLINE lookupEncodedHamt #-}
+-- lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> Smol 1 -> Either String (Maybe v)
+-- lookupEncodedHamt !key !smol =
+--   runGet (go 5) (smol ^. lookupBuffer) >>=
+--     maybe
+--       (return Nothing)
+--       getValueFromLeafAtOffset
+--   where
+--   h = lookupHash key
+--   {-# INLINE findInLeaves #-}
+--   findInLeaves o =
+--     uncheckedSkip (fromIntegral o) >>
+--     fmap _v . find (has (k.only key)) <$> getListOf' get
+--   {-# INLINE getValueFromLeafAtOffset #-}
+--   getValueFromLeafAtOffset o = runGet (findInLeaves o) (smol ^. leavesBuffer)
+--   {-# INLINE go #-}
+--   go !currentLevel = getWord8 >>= \case
+--     1 ->
+--        getVarLength <&> Just . _unVarLength
+--     0 ->
+--       let
+--         nextLevel = currentLevel - 1
+--         !idxIntoBitmap = idxIntoBitmapForPos currentLevel h
+--         {-# INLINE getOffset #-}
+--         getOffset = do
+--           uncheckedSkip (sizeOf (undefined :: Word16)) -- 2 bytes indicating the size of this block
+--           !bm <- get
+--           !sizeOfOffset <- fromEnum <$> getWord8
+--           let
+--             isChildPresent = checkBit bm idxIntoBitmap
+--             offset = popCountToRightOf idxIntoBitmap bm
+--           if isChildPresent
+--           then -- get the offset
+--             uncheckedSkip (offset * sizeOfOffset) >>
+--             Just <$> getFromSize sizeOfOffset
+--           else return Nothing
+--       in lookAhead getOffset >>=
+--         maybe
+--           (return Nothing)
+--           (\(!offset) -> do
+--             getWord16be >>= uncheckedSkip . fromEnum -- UncheckedSkip this block
+--             uncheckedSkip (fromEnum offset) >> go nextLevel)
+--     _ -> fail "Cannot match a leaf or an internal node"
 
-{-# INLINE getFromSize #-}
-getFromSize :: Int -> Get Int
-getFromSize sizeOfOffset =
+deSerFromSize :: MonadDeSer m => Int -> m Int
+deSerFromSize sizeOfOffset =
   if sizeOfOffset == 1
-  then getWord8 <&> fromIntegral
+  then deser @Word8 <&> fromIntegral
   else if sizeOfOffset == 2
-  then getWord16be <&> fromIntegral
+  then deser @(Word16 @ BigE) <&> fromIntegral
   else if sizeOfOffset == 4
-  then getWord32be <&> fromIntegral
-  else getWord64be <&> fromIntegral
+  then deser @(Word16 @ BigE) <&> fromIntegral
+  else deser @(Word64 @ BigE) <&> fromIntegral
+
+-- {-# INLINE getFromSize #-}
+-- getFromSize :: Int -> Get Int
+-- getFromSize sizeOfOffset =
+--   if sizeOfOffset == 1
+--   then getWord8 <&> fromIntegral
+--   else if sizeOfOffset == 2
+--   then getWord16be <&> fromIntegral
+--   else if sizeOfOffset == 4
+--   then getWord32be <&> fromIntegral
+--   else getWord64be <&> fromIntegral
 
 {-# INLINE putListOf' #-}
 putListOf' :: Putter a -> Putter [a]

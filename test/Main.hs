@@ -2,6 +2,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 module Main (main) where
 
+import qualified SerDe as SerDe
 import Data.Foldable
 import Data.Functor
 import Data.Bits
@@ -15,38 +16,11 @@ import Data.Aeson
 import qualified Data.Vector as V
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
-import Data.Smol.JSON
 import Data.Smol
 import Data.VarLength
 import Debug.Trace
-
-genNull :: MonadGen m => m Value
-genNull = return Null
-
-genString :: MonadGen m => m Value
-genString = String <$> Gen.text (Range.constant 1 100) Gen.alphaNum
-
-genNumber :: MonadGen m => m Value
-genNumber =
-  Gen.choice [integrals]--, doubles
-  where
-    integrals = Number . fromIntegral <$> Gen.int (Range.constantBounded)
---     doubles = Number . (realToFrac @Double) <$> Gen.realFrac_ (Range.constantFrom 0 (-10000) 10000)
-
-genBool :: MonadGen m => m Value
-genBool = Bool <$> Gen.bool
-
-genValue :: MonadGen m => m Value
-genValue =
-  Gen.recursive Gen.choice [genNull, genString, genNumber, genBool] [genArray, genKeyMap]
-  where
-  genArray = Array . V.fromList <$> Gen.list (Range.constant 0 10) genValue
-  genKeyMap = Object . KM.fromList <$> (genKValuePairs (Range.constantFrom 10 1 20))
-
-genKValuePairs :: MonadGen m => Range Int -> m [(Key, Value)]
-genKValuePairs range = Gen.list range ((,) <$> genKey <*> genValue)
-  where
-  genKey = Key.fromText <$> Gen.text (Range.constant 1 100) Gen.alphaNum
+import Data.DeSer
+import JSON
 
 genHAMT ::MonadGen m => Range Int -> m (HAMT Key Value)
 genHAMT = fmap fromKVPairs . genKValuePairs
@@ -57,12 +31,13 @@ main = do
 
 tests :: IO Bool
 tests =
-  checkParallel $
-    Group "Data.Smol"
-    [ ("prop_var_length_encoding_works", propVarLengthEncodingWorks)
-    , ("prop_lookup_works", propLookupWorks)
+  checkSequential $ Group "Deser" SerDe.props
+--   checkParallel $
+--     Group "Data.Smol"
+--     [ ("prop_var_length_encoding_works", propVarLengthEncodingWorks)
+--     , ("prop_lookup_works", propLookupWorks)
 --     , ("prop_serialize_preserves", propSerializePreserves)
-    ]
+--     ]
 
 propSerializePreserves :: Property
 propSerializePreserves =
@@ -89,8 +64,9 @@ propLookupWorks =
     let
       keys = kvs <&> fst
       bs = Ser.encode $ serializeHAMT $ fromKVPairs kvs
+      Right smol = Ser.decode @(Smol 1) bs
     k <- forAll (Gen.element keys)
     let
-      Right maybeValue = lookupEncodedSmol k bs
+      Right maybeValue = lookupEncodedHamt k smol
       equality = maybeValue == (snd <$> find ((== k). fst) kvs)
     assert equality

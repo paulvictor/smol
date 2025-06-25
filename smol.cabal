@@ -63,6 +63,7 @@ library
         Data.Smol
       , Data.Smol.JSON
       , Data.VarLength
+      , Data.DeSer
 
     default-extensions:
         TemplateHaskell
@@ -92,6 +93,7 @@ library
       , scientific
       , mtl
       , transformers
+      , tagged
 
     -- Directories containing source files.
     hs-source-dirs:   src
@@ -162,4 +164,6 @@ test-suite smol-test
         hedgehog,
         aeson,
         cereal,
-        vector
+        vector,
+        text,
+        bytestring
