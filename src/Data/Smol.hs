@@ -291,11 +291,11 @@ lookupEncodedHamt !key !smol =
       (return Nothing)
       getValueFromLeafAtOffset
   where
-  h = lookupHash key
+  !h = lookupHash key
   {-# INLINE findInLeaves #-}
   findInLeaves o =
     uncheckedSkip (fromIntegral o) >>
-    fmap _v . find (has (k.only key)) <$> getListOf' get
+    (findGet (has (k.only key)) get <&> fmap _v)
   {-# INLINE getValueFromLeafAtOffset #-}
   getValueFromLeafAtOffset o = runGet (findInLeaves o) (smol ^. leavesBuffer)
   {-# INLINE go #-}
@@ -340,7 +340,7 @@ getFromSize sizeOfOffset =
 
 {-# INLINE putListOf' #-}
 putListOf' :: Putter a -> Putter [a]
-putListOf' pa = \xs ->
+putListOf' pa xs =
   put (_VarLength (fromIntegral $ length xs)) >>
   mapM_ pa xs
 
@@ -349,3 +349,14 @@ getListOf' :: Get a -> Get [a]
 getListOf' g = do
   !l <- fromIntegral . _unVarLength <$> getVarLength
   replicateM l g
+
+{-# INLINE findGet #-}
+findGet :: (a -> Bool) -> Get a -> Get (Maybe a)
+findGet pred g = do
+  !l <- fromEnum . _unVarLength <$> getVarLength
+  loop l
+  where
+    loop 0 = return Nothing
+    loop !i = do
+      !a <- g
+      if pred a then return $! Just a else loop (i-1)
