@@ -36,16 +36,16 @@ hush = either (const Nothing) Just
 
 main :: IO ()
 main =
-  execParser (info optionsParser mempty) >>= lookup_
 --   convert
+  execParser (info optionsParser mempty) >>= lookup_
 
 lookup_ :: [Key] -> IO ()
 lookup_ keys =
   runConduit $
     stdin
     .| Zstd.decompress
-    .| conduitGet2 (get @(Smol 1))
-    .| C.map ((\bs -> KM.fromList (keys <&> (\key -> (key, join $ hush (lookupEncodedHamt @Key @Value key bs))))) . _unSmol)
+    .| conduitGet2 get
+    .| C.map (\smol1 -> KM.fromList (keys <&> (\key -> (key, join $ hush (lookupEncodedHamt @Key @Value key smol1)))))
     .| C.map encode
     .| C.mapM_ (LBS.putStrLn)
 

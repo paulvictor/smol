@@ -24,8 +24,8 @@ _VarLength = VarLength
 getVarLength :: Get (VarLength' b)
 getVarLength = VarLength <$> go (0 :: Word)
   where
-  go prev = do
-    !w8 <- getWord8
+  go !prev = do
+    w8 <- getWord8
     let
       !next = (prev .<<. 7) .|. (fromIntegral (clearBit w8 7))
     if testBit w8 7
@@ -46,7 +46,7 @@ instance Serialize (VarLength' False) where
 
 instance Serialize (VarLength' True) where
   {-# INLINE put #-}
-  put (VarLength !i) =
+  put (VarLength i) =
     let
       quot128 = i `shiftR` 7
       rem128 = (i .&. ((bit 7) - 1)) .|. bit 7
@@ -83,4 +83,3 @@ putLengthEncodedBS bs =
 getLengthEncodedBS :: Get ByteString
 getLengthEncodedBS =
   get @VarLength >>= getBytes . fromIntegral . _unVarLength
-
