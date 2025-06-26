@@ -1,19 +1,22 @@
 {-# LANGUAGE DataKinds #-}
 module Data.DeSer
   ( runDeSer
-  , DeSerError
+  , DeSerError(..)
   , DeSer
+  , DeSerializing
   , MonadDeSer
   , Endian(..)
   , lookAhead
   , bytesConsumed
   , deserTwo
   , deserMany
+  , deserListOf
   , type (@)
   , deserManyTillEnd
   , skip
   , deser) where
 
+import Debug.Trace
 import Control.Lens.Combinators
 import Data.Aeson.Lens
 import Data.Scientific (fromFloatDigits)
@@ -89,27 +92,15 @@ instance DeSer (Word16 @ BigE) where
   {-# INLINE deser #-}
   deser = do
     bs <- getBytes 2
-    let
-      (fp, _) = BS.toForeignPtr0 bs
-    return $
-      unsafePerformIO $
-        withForeignPtr fp (\ptr -> do
-          (msb :: Word8) <- peekByteOff ptr 0
-          (lsb :: Word8) <- peekByteOff ptr 1
-          return $! fromIntegral $ (msb .<<. 8) .|. lsb)
+    return $! (fromIntegral (bs `BS.unsafeIndex` 0) `shiftL` 8) .|.
+              (fromIntegral (bs `BS.unsafeIndex` 1))
 
 instance DeSer (Word16 @ LitE) where
   {-# INLINE deser #-}
   deser = do
     bs <- getBytes 2
-    let
-      (fp, _) = BS.toForeignPtr0 bs
-    return $
-      unsafePerformIO $
-        withForeignPtr fp (\ptr -> do
-          (lsb :: Word8) <- peekByteOff ptr 0
-          (msb :: Word8) <- peekByteOff ptr 1
-          return $! fromIntegral $ (msb .<<. 8) .|. lsb)
+    return $! (fromIntegral (bs `BS.unsafeIndex` 1) `shiftL` 8) .|.
+              (fromIntegral (bs `BS.unsafeIndex` 0))
 
 instance DeSer (Word32 @ BigE) where
   {-# INLINE deser #-}
@@ -154,30 +145,41 @@ instance DeSer Double where
     wordToDouble w = unsafeDupablePerformIO $ alloca $ \(ptr :: Ptr Word64) ->
       poke ptr w >> peek (castPtr ptr)
 
-instance (DeSer VarLength) where
-  {-# INLINE deser #-}
-  deser =
-    _VarLength <$> loop 0
+{-# INLINE deserVarLength #-}
+deserVarLength :: (MonadDeSer m) => m (VarLength' b)
+deserVarLength =
+  VarLength <$> loop 0
     where
     loop prev = do
-      w8 <- deser @Word8
+      !w8 <- deser @Word8
       let
         !next = (prev .<<. 7) .|. (fromIntegral (clearBit w8 7))
       if testBit w8 7
         then loop next -- we need to get more bytes
         else -- at the last byte. The msb should be 0
           return $ (prev .<<. 7) .|. next -- could have used next?
+instance DeSer (VarLength' True) where
+  {-# INLINE deser #-}
+  deser = deserVarLength
+instance DeSer (VarLength' False) where
+  {-# INLINE deser #-}
+  deser = deserVarLength
 
 instance DeSer ByteString where
   {-# INLINE deser #-}
-  deser =
-    deser @VarLength >>= getBytes . fromIntegral . _unVarLength
+  deser = deser @VarLength >>= getBytes . fromIntegral . _unVarLength
 
 instance DeSer a => DeSer [a] where
   {-# INLINE deser #-}
   deser = do
     len <- fromIntegral . _unVarLength <$> deser @VarLength
     replicateM len deser
+
+{-# INLINE deserListOf #-}
+deserListOf :: (DeSer a) => DeSerializing a -> DeSerializing [a]
+deserListOf d = do
+  len <- fromIntegral . _unVarLength <$> deser @VarLength
+  replicateM len d
 
 instance (DeSer a, DeSer b) => DeSer (a, b) where
   {-# INLINE deser #-}
@@ -213,11 +215,12 @@ instance DeSer Bool where
     i -> throwError (InvalidEncoding (show i))
 
 {-# INLINE lookAhead #-}
-lookAhead :: (DeSer a, MonadDeSer m) => m a
-lookAhead = do
+lookAhead :: DeSerializing a -> DeSerializing a
+lookAhead d = do
   pos <- State.get
-  deser <* State.put pos
+  d <* State.put pos
 
+{-# INLINE bytesConsumed #-}
 bytesConsumed :: (MonadDeSer m) => m Int
 bytesConsumed = State.get
 
@@ -232,6 +235,7 @@ atEnd = do
   pos <- State.get
   return (pos == maxL - 1)
 
+{-# INLINE deserTwo #-}
 deserTwo :: DeSerializing k -> DeSerializing v -> DeSerializing (k, v)
 deserTwo dk dv = (,) <$> dk <*> dv
 
@@ -246,11 +250,13 @@ deserManyTillEnd d = loop []
       then return $! xs
       else loop (a:xs)
 
+{-# INLINE deserMany #-}
 deserMany :: DeSerializing a -> DeSerializing [a]
 deserMany d = do
   len <- fromIntegral . _unVarLength <$> deser @VarLength
   replicateM len d
 
+{-# INLINE runDeSer #-}
 -- TODO, if we need the unused bytestring, read from pos to end and return it
 runDeSer :: DeSerializing a -> ByteString -> Either DeSerError a
 runDeSer x =
@@ -273,4 +279,4 @@ instance DeSer Value where
     4 -> String . T.decodeUtf8 <$> deser @ByteString
     5 -> Bool <$> deser
     6 -> return Null
-    i -> throwError $ InvalidEncoding ("Expected w8 less than 7, got " <> show i)
+    i -> throwError $ InvalidEncoding (show i)

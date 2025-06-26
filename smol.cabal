@@ -64,6 +64,7 @@ library
       , Data.Smol.JSON
       , Data.VarLength
       , Data.DeSer
+      , Data.Bitmap
 
     default-extensions:
         TemplateHaskell

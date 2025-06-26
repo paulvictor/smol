@@ -1,69 +1,42 @@
 {-# LANGUAGE OverloadedLists #-}
+{-# LANGUAGE ViewPatterns #-}
 module Data.Smol
-  ( -- lookupEncodedHamt
-  trimHAMT
+  ( lookupEncodedHamt
+  , trimHAMT
   , serializeHAMT
   , lookupHAMT
-  --, deserializeHAMT
+  , deserializeHAMT
   , LeafElem(..)
   , HAMT(..)
   , Smol(..)
   , fromKVPairs ) where
 
-import Data.Word
-import Data.Serialize
-import Control.Lens.Operators
+import Debug.Trace
+import Control.Monad.Error.Class (throwError)
 import Control.Lens.Combinators
-import Numeric.Lens
-import Data.Bits
-import Data.Hashable
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as LBS
-import qualified Data.ByteString.Builder as B
-import Data.ByteString.Builder (Builder)
-import Data.Sequence (Seq(..))
-import qualified Data.Sequence as Seq
-import Data.VarLength
-import Data.Foldable
-import Data.Traversable
-import Foreign.Storable (sizeOf)
-import Data.Tree (drawTree, Tree(..))
-import GHC.TypeLits
+import Control.Lens.Operators
 import Control.Monad
 import Control.Monad.Trans.State.Strict (runState)
+import Data.Bitmap
+import Data.Bits
+import Data.ByteString.Builder (Builder)
+import Data.ByteString (ByteString)
 import Data.DeSer
-import Data.Tagged
-
--- bitmap is a vector of 256 bits
-newtype Bitmap = Bitmap { _unBitmap :: Word64 } deriving (Eq)
-
-instance Show Bitmap where
-  show (Bitmap bm) =
-    "Ox" <> (bm ^. re hex)
-
-instance Serialize Bitmap where
-  put (Bitmap bm) = putWord64be bm
-  get = Bitmap <$> getWord64be
-
-emptyBM :: Bitmap
-emptyBM = Bitmap zeroBits
-
-{-# INLINE setBitBM #-}
-setBitBM :: Word8 -> Bitmap -> Bitmap
-setBitBM i (Bitmap bm) = Bitmap $ setBit bm (fromEnum i)
-
-{-# INLINE checkBit #-}
-checkBit :: Bitmap -> Word8 -> Bool
-checkBit (Bitmap bm) i = testBit bm (fromEnum i)
-
-{-# INLINE popCountToRightOf #-}
-popCountToRightOf :: Word8 -> Bitmap -> Int
-popCountToRightOf pos (Bitmap bm) =
-  let
-    bitMask = (1 `shiftL` fromEnum pos) - 1
-  in
-    popCount $ bitMask .&. bm
+import Data.Foldable
+import Data.Hashable
+import Data.Sequence (Seq(..))
+import Data.Serialize
+import Data.Traversable
+import Data.Tree (drawTree, Tree(..))
+import Data.VarLength
+import Data.Word
+import Foreign.Storable (sizeOf)
+import GHC.TypeLits
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as B
+import qualified Data.ByteString.Lazy as LBS
+import qualified Data.DeSer as DeSer
+import qualified Data.Sequence as Seq
 
 -- Used for construction
 data LeafElem k v =
@@ -80,6 +53,7 @@ instance (Serialize k, Serialize v) => Serialize (LeafElem k v) where
   get = LeafElem <$> get <*> get
 
 instance (DeSer k, DeSer v) => DeSer (LeafElem k v) where
+  {-# INLINE deser #-}
   deser = LeafElem <$> deser <*> deser
 
 data HAMT k v
@@ -118,7 +92,7 @@ trimHAMT = \case
       else nodeWithTrimmedChildren
 
 fromKVPairs :: (Foldable t, Serialize k, Serialize v, Hashable k) => t (k, v) -> HAMT k v
-fromKVPairs = foldr (\(k, v) hamt -> consHAMT k v hamt) (empty 5)
+fromKVPairs = foldr (\(k0, v0) hamt -> consHAMT k0 v0 hamt) (empty 5)
 
 empty :: Int -> HAMT k v
 empty level =
@@ -202,8 +176,7 @@ lookupHAMT key root = go 5 root
 --Smol and friends
 data Smol (version :: Nat) = Smol
   { _lookupBuffer :: !ByteString
-  , _leavesCount :: Word32
-  , _leavesBuffer :: ByteString }
+  , _leavesBuffer :: ByteString } deriving (Show, Eq)
 
 $(makeLenses ''Smol)
 
@@ -214,9 +187,8 @@ instance Serialize (Smol 1) where
     version <- getWord8
     guard (toInteger version == 1) -- Right now only Version 1
     _lookupBuffer <- getLengthEncodedBS
-    _leavesCount <- getWord32be
     _leavesBuffer <- getLengthEncodedBS
-    return $! Smol {_lookupBuffer, _leavesCount, _leavesBuffer}
+    return $! Smol {_lookupBuffer, _leavesBuffer}
 
   put (Smol {..}) =
     putByteString "SMOL" >>
@@ -228,6 +200,7 @@ data S = S
   { _leavesBuilder :: Builder
   , _count :: Word32 -- Count is useful for deserializeHAMT to find number of leaves
   , _offset :: Int }
+
 $(makeLenses ''S)
 
 --Serialize all children and get the bytestrings. Calculate the length of each, and adjust offsets
@@ -237,8 +210,7 @@ serializeHAMT :: forall k v. (Serialize k, Serialize v) => HAMT k v -> Smol 1
 serializeHAMT hamt =
   Smol
     { _lookupBuffer
-    , _leavesBuffer = LBS.toStrict $ B.toLazyByteString _leavesBuilder
-    , _leavesCount = _count }
+    , _leavesBuffer = LBS.toStrict $ B.toLazyByteString _leavesBuilder }
   where
   (_lookupBuffer, S{..}) =
     runState (go hamt) (S mempty 0 0)
@@ -279,64 +251,67 @@ serializeHAMT hamt =
             mapM_ putByteString serializedChildren
       return serializedNode
 
--- deserializeHAMT :: forall k v. (Serialize k, Serialize v) => Smol 1 -> Either String [(k, v)]
--- deserializeHAMT (Smol {_leavesCount, _leavesBuffer}) =
---   runGet
---     (replicateM (fromIntegral _leavesCount) (getListOf' get))
---     _leavesBuffer
---   <&> concat
---   <&> fmap (\(LeafElem k v)  -> (k, v))
-
 deserializeHAMT :: forall k v. (DeSer k, DeSer v) => Smol 1 -> Either DeSerError [(k, v)]
 deserializeHAMT (Smol {_leavesBuffer}) =
   runDeSer (deserManyTillEnd (deserMany @(LeafElem k v) deser)) _leavesBuffer
   <&> concat
-  <&> fmap (\(LeafElem k v) -> (k, v))
+  <&> fmap (\(LeafElem k0 v0) -> (k0, v0))
 
--- {-# INLINE lookupEncodedHamt #-}
--- lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> Smol 1 -> Either String (Maybe v)
--- lookupEncodedHamt !key !smol =
---   runGet (go 5) (smol ^. lookupBuffer) >>=
---     maybe
---       (return Nothing)
---       getValueFromLeafAtOffset
---   where
---   h = lookupHash key
---   {-# INLINE findInLeaves #-}
---   findInLeaves o =
---     uncheckedSkip (fromIntegral o) >>
---     fmap _v . find (has (k.only key)) <$> getListOf' get
---   {-# INLINE getValueFromLeafAtOffset #-}
---   getValueFromLeafAtOffset o = runGet (findInLeaves o) (smol ^. leavesBuffer)
---   {-# INLINE go #-}
---   go !currentLevel = getWord8 >>= \case
---     1 ->
---        getVarLength <&> Just . _unVarLength
---     0 ->
---       let
---         nextLevel = currentLevel - 1
---         !idxIntoBitmap = idxIntoBitmapForPos currentLevel h
---         {-# INLINE getOffset #-}
---         getOffset = do
---           uncheckedSkip (sizeOf (undefined :: Word16)) -- 2 bytes indicating the size of this block
---           !bm <- get
---           !sizeOfOffset <- fromEnum <$> getWord8
---           let
---             isChildPresent = checkBit bm idxIntoBitmap
---             offset = popCountToRightOf idxIntoBitmap bm
---           if isChildPresent
---           then -- get the offset
---             uncheckedSkip (offset * sizeOfOffset) >>
---             Just <$> getFromSize sizeOfOffset
---           else return Nothing
---       in lookAhead getOffset >>=
---         maybe
---           (return Nothing)
---           (\(!offset) -> do
---             getWord16be >>= uncheckedSkip . fromEnum -- UncheckedSkip this block
---             uncheckedSkip (fromEnum offset) >> go nextLevel)
---     _ -> fail "Cannot match a leaf or an internal node"
+{-# INLINE lookupEncodedHamt #-}
+lookupEncodedHamt
+  :: forall k v
+  . (Eq k, Hashable k, DeSer k, DeSer v)
+  => k
+  -> Smol 1
+  -> Either DeSerError (Maybe v)
+lookupEncodedHamt !key !smol =
+  runDeSer (go 5) (smol ^. lookupBuffer) >>=
+    maybe
+      (return Nothing)
+      getValueFromLeafAtOffset
+  where
+  !h = lookupHash key
+  {-# INLINE findInLeaves #-}
+  findInLeaves o =
+    DeSer.skip (fromIntegral o) >>
+    fmap _v . find (has (k.only key)) <$> DeSer.deserListOf (deser @(LeafElem k v))
+  {-# INLINE getValueFromLeafAtOffset #-}
+  getValueFromLeafAtOffset o =
+    runDeSer
+      (findInLeaves o)
+      (smol ^. leavesBuffer)
+  {-# INLINE go #-}
+  go !currentLevel = deser @Word8 >>= \case
+    1 ->
+       deser @VarLength <&> Just . _unVarLength
+    0 ->
+      let
+        nextLevel = currentLevel - 1
+        !idxIntoBitmap = idxIntoBitmapForPos currentLevel h
+        {-# INLINE getOffset #-}
+        getOffset = do
+          DeSer.skip (sizeOf (undefined :: Word16)) -- 2 bytes indicating the size of this block
+          !bm <- deser
+          !sizeOfOffset <- fromEnum <$> deser @Word8
+          let
+            isChildPresent = checkBit bm idxIntoBitmap
+            offset = popCountToRightOf idxIntoBitmap bm
+          if isChildPresent
+          then -- get the offset
+            DeSer.skip (offset * sizeOfOffset) >>
+            Just <$> deSerFromSize sizeOfOffset
+          else return Nothing
+      in
+        DeSer.lookAhead getOffset >>=
+          maybe
+            (return Nothing)
+            (\(!offset) -> do
+              deser @(Word16 @ BigE) >>= DeSer.skip . fromEnum
+              DeSer.skip (fromEnum offset) >> go nextLevel
+            )
+    i -> throwError $ InvalidEncoding (show i)
 
+{-# INLINE deSerFromSize #-}
 deSerFromSize :: MonadDeSer m => Int -> m Int
 deSerFromSize sizeOfOffset =
   if sizeOfOffset == 1
@@ -346,17 +321,6 @@ deSerFromSize sizeOfOffset =
   else if sizeOfOffset == 4
   then deser @(Word16 @ BigE) <&> fromIntegral
   else deser @(Word64 @ BigE) <&> fromIntegral
-
--- {-# INLINE getFromSize #-}
--- getFromSize :: Int -> Get Int
--- getFromSize sizeOfOffset =
---   if sizeOfOffset == 1
---   then getWord8 <&> fromIntegral
---   else if sizeOfOffset == 2
---   then getWord16be <&> fromIntegral
---   else if sizeOfOffset == 4
---   then getWord32be <&> fromIntegral
---   else getWord64be <&> fromIntegral
 
 {-# INLINE putListOf' #-}
 putListOf' :: Putter a -> Putter [a]

@@ -1,12 +1,12 @@
 module Data.VarLength
   ( VarLength
+  , VarLength'(..)
   , varLengthEncoded
   , getLengthEncoded
   , _VarLength
   , getVarLength
   , putLengthEncodedBS
-  , getLengthEncodedBS
-  , _unVarLength ) where
+  , getLengthEncodedBS) where
 
 import Data.Serialize
 import Data.Bits
