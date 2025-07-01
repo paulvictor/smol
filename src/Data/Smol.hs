@@ -134,7 +134,7 @@ idxIntoBitmapForPos pos h =
 consHAMT :: Hashable k => k -> v -> HAMT k v -> HAMT k v
 consHAMT key value = go 5
   where
-  h = lookupHash key
+  !h = lookupHash key
   go _ node@(Leaf _) =
     -- This is not really overwriting the key/value but it prepends to the left of the seq and
     -- transfers the responsibility to lookup, which goes in sequence,
@@ -142,7 +142,7 @@ consHAMT key value = go 5
     -- May lead to space leak because the underlying k and v are still in reference.
     node &
       values %~ ((<|) (LeafElem key value))
-  go currentLevel node@(Internal {..}) =
+  go !currentLevel !node@(Internal {..}) =
     -- check if bit is set.
     -- if set, then extract the child and recursively call go
     -- if not set, create a child, modify the data structures accordingly after inserting
@@ -302,7 +302,6 @@ lookupEncodedHamt !key !smol =
   go !currentLevel = getWord8 >>= \case
     1 ->
        getVarLength <&> Just . _unVarLength
-
     0 ->
       let
         nextLevel = currentLevel - 1
