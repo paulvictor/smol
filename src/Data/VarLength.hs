@@ -12,6 +12,7 @@ import Data.Serialize
 import Data.Bits
 import Data.Functor
 import Data.ByteString (ByteString)
+
 -- The bool represents if we need to set the msb
 -- If unknown, pass False.
 -- Should we create a type alias for external use?
@@ -83,3 +84,13 @@ putLengthEncodedBS bs =
 getLengthEncodedBS :: Get ByteString
 getLengthEncodedBS =
   get @VarLength >>= getBytes . fromIntegral . _unVarLength
+
+-- instance Ser (VarLength' False) where
+--   {-# INLINE ser #-}
+--   ser (VarLength i) =
+--     let
+--       quot128 = i `shiftR` 7
+--       rem128 = i .&. ((bit 7) - 1)
+--     in if i < 128 then SerBuffer (Builder.word8 (fromIntegral i)) 1
+--     else ser (VarLength @True quot128) >> ser (fromIntegral rem128)
+
