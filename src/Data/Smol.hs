@@ -41,9 +41,11 @@ instance Show Bitmap where
     "Ox" <> (bm ^. re hex)
 
 instance Serialize Bitmap where
+  {-# INLINE put #-}
   put (Bitmap bm) = putWord64be bm
   get = Bitmap <$> getWord64be
 
+{-# INLINE emptyBM #-}
 emptyBM :: Bitmap
 emptyBM = Bitmap zeroBits
 
@@ -73,6 +75,7 @@ data LeafElem k v =
 $(makeLenses ''LeafElem)
 
 instance (Serialize k, Serialize v) => Serialize (LeafElem k v) where
+  {-# INLINE put #-}
   put (LeafElem {_k, _v}) = put _k >> put _v
   {-# INLINE get #-}
   get = LeafElem <$> get <*> get
@@ -98,11 +101,13 @@ instance (Show k, Show v) => Show (HAMT k v) where
       Internal bm xs -> Node (Left bm) (toList $ toTree <$> xs)
       Leaf xs -> Node (Right xs) []
 
+{-# INLINE trimHAMT #-}
 trimHAMT :: HAMT k v -> HAMT k v
 trimHAMT = \case
   l@(Leaf _) -> l
   node@(Internal {}) ->
     let
+      {-# INLINE nodeWithTrimmedChildren #-}
       nodeWithTrimmedChildren =
         node &
           orderedChildren.traversed %~ trimHAMT
@@ -112,9 +117,11 @@ trimHAMT = \case
       then firstTrimmed
       else nodeWithTrimmedChildren
 
+{-# INLINE fromKVPairs #-}
 fromKVPairs :: (Foldable t, Serialize k, Serialize v, Hashable k) => t (k, v) -> HAMT k v
-fromKVPairs = foldr (\(k, v) hamt -> consHAMT k v hamt) (empty 5)
+fromKVPairs = foldr' (\(k, v) -> consHAMT k v) (empty 5)
 
+{-# INLINE empty #-}
 empty :: Int -> HAMT k v
 empty level =
   if level == 0
@@ -131,10 +138,11 @@ idxIntoBitmapForPos :: Int -> Word64 -> Word8
 idxIntoBitmapForPos pos h =
   fromIntegral $ (h .>>. (pos*6)) .&. ((1 `shiftL` 6) - 1)
 
+{-# INLINE consHAMT #-}
 consHAMT :: Hashable k => k -> v -> HAMT k v -> HAMT k v
-consHAMT key value = go 5
+consHAMT !key !value = go 5
   where
-  !h = lookupHash key
+  h = lookupHash key
   go _ node@(Leaf _) =
     -- This is not really overwriting the key/value but it prepends to the left of the seq and
     -- transfers the responsibility to lookup, which goes in sequence,
@@ -197,66 +205,77 @@ lookupHAMT key root = go 5 root
 --Smol and friends
 data Smol (version :: Nat) = Smol
   { _lookupBuffer :: !ByteString
-  , _leavesCount :: Word32
-  , _leavesBuffer :: ByteString }
+  , _leavesCount :: !Word32
+  , _leavesBuffer :: !ByteString }
 
 $(makeLenses ''Smol)
 
 instance Serialize (Smol 1) where
   get = do
-    !identifier <- getBytes 4
-    guard (identifier == "SMOL")
-    version <- getWord8
-    guard (toInteger version == 1) -- Right now only Version 1
-    _lookupBuffer <- getLengthEncodedBS
-    _leavesCount <- getWord32be
-    _leavesBuffer <- getLengthEncodedBS
-    return $! Smol {_lookupBuffer, _leavesCount, _leavesBuffer}
+    !l <- getWord32be <&> fromIntegral
+    !bs <- getBytes l
+    either fail return (runGet inner bs)
+    where
+    inner = do
+      identifier <- getBytes 4
+      guard (identifier == "SMOL")
+      version <- getWord8
+      guard (toInteger version == 1) -- Right now only Version 1
+      _lookupBuffer <- getLengthEncodedBS
+      _leavesCount <- getWord32be
+      _leavesBuffer <- getLengthEncodedBS
+      return $! Smol {_lookupBuffer, _leavesCount, _leavesBuffer}
 
   put (Smol {..}) =
-    putByteString "SMOL" >>
-    putWord8 1 >>
-    putLengthEncodedBS _lookupBuffer >>
-    putWord32be _leavesCount >>
-    putLengthEncodedBS _leavesBuffer
+    putNested
+      (putWord32be . fromIntegral)
+      putStruct
+    where
+      putStruct =
+        putByteString "SMOL" >>
+        putWord8 1 >>
+        putLengthEncodedBS _lookupBuffer >>
+        putWord32be _leavesCount >>
+        putLengthEncodedBS _leavesBuffer
 
 data S = S
-  { _leavesBuilder :: Builder
-  , _count :: Word32 -- Count is useful for deserializeHAMT to find number of leaves
-  , _offset :: Int }
+  { _leavesBuilder :: !Builder
+  , _count :: !Word32 -- Count is useful for deserializeHAMT to find number of leaves
+  , _offset :: !Int }
 $(makeLenses ''S)
 
 --Serialize all children and get the bytestrings. Calculate the length of each, and adjust offsets
 -- This serialize/deserializeHAMT is not considering headers
 
+{-# INLINE serializeHAMT #-}
 serializeHAMT :: forall k v. (Serialize k, Serialize v) => HAMT k v -> Smol 1
-serializeHAMT hamt =
+serializeHAMT !hamt =
   Smol
     { _lookupBuffer
     , _leavesBuffer = LBS.toStrict $ B.toLazyByteString _leavesBuilder
     , _leavesCount = _count }
   where
-  (_lookupBuffer, S{..}) =
+  (!_lookupBuffer, S{_leavesBuilder, _count}) =
     runState (go hamt) (S mempty 0 0)
   go = \case
     node@(Leaf _) -> do
-      o <- _VarLength . fromIntegral <$> use offset
+      !o <- _VarLength . fromIntegral <$> use offset
       let
         serializedLeaf = runPut $
           putWord8 1 >> put o
-        lbs = runPutLazy $ putListOf' put (node ^. values)
-        l = LBS.length lbs
+        !lbs = runPutLazy $ putListOf' put (node ^. values)
+        !l = LBS.length lbs
       leavesBuilder <>= B.lazyByteString lbs
       count += 1
       offset += fromIntegral l
-      return serializedLeaf
+      return $! serializedLeaf
     node@(Internal {..}) -> do
-      serializedChildren <- for (node ^. orderedChildren) go
+      !serializedChildren <- for (node ^. orderedChildren) go
       let
         offsets :|> _ =
           Seq.scanl (+) 0 $
             BS.length <$> serializedChildren
-        maxOffset = maximum offsets
+        _ :|> maxOffset = offsets
         (offsetsPut, !numWordsPerOffset) =
           if maxOffset < (fromEnum (maxBound @Word8))
           then (mapM_ (putWord8 . toEnum) offsets, 1)
@@ -266,14 +285,14 @@ serializeHAMT hamt =
           then (mapM_ (putWord32be . toEnum) offsets, 4)
           else (mapM_ (putWord64be . toEnum) offsets, 8)
         serializedNode = runPut $
-          put (0 :: Word8) >>
-            putNested
-              (putWord16be . toEnum)
-              (put _bitmap >>
-               putWord8 numWordsPerOffset >>
-               offsetsPut) >>
-            mapM_ putByteString serializedChildren
-      return serializedNode
+          putWord8 0 >>
+          putNested
+            (putWord16be . toEnum)
+            (put _bitmap >>
+             putWord8 numWordsPerOffset >>
+             offsetsPut) >>
+          mapM_ putByteString serializedChildren
+      return $! serializedNode
 
 deserializeHAMT :: forall k v. (Serialize k, Serialize v) => Smol 1 -> Either String [(k, v)]
 deserializeHAMT (Smol {_leavesCount, _leavesBuffer}) =

@@ -61,7 +61,7 @@ tests =
     Group "Data.Smol"
     [ ("prop_var_length_encoding_works", propVarLengthEncodingWorks)
     , ("prop_lookup_works", propLookupWorks)
---     , ("prop_serialize_preserves", propSerializePreserves)
+    , ("prop_serialize_preserves", propSerializePreserves)
     ]
 
 propSerializePreserves :: Property
@@ -89,8 +89,9 @@ propLookupWorks =
     let
       keys = kvs <&> fst
       bs = Ser.encode $ serializeHAMT $ fromKVPairs kvs
+      Right smol1 = Ser.decode @(Smol 1) bs
     k <- forAll (Gen.element keys)
     let
-      Right maybeValue = lookupEncodedSmol k bs
+      Right maybeValue = lookupEncodedHamt k smol1
       equality = maybeValue == (snd <$> find ((== k). fst) kvs)
     assert equality
