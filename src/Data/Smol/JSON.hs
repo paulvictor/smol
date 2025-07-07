@@ -3,6 +3,7 @@ module Data.Smol.JSON where
 
 import Data.Aeson
 import Data.Aeson.Lens
+import Data.Aeson.KeyMap (KeyMap)
 import qualified Data.Aeson.KeyMap as KM
 import Data.Serialize
 import qualified Data.Vector as V'
@@ -11,6 +12,8 @@ import Control.Lens.Operators
 import Control.Lens.Combinators
 import Data.VarLength
 import Data.Scientific
+import Data.Functor
+import Control.Monad
 
 -- We use this because the default put encodes the length as Int64 which may not be necessary
 instance Serialize Key where
@@ -24,10 +27,11 @@ instance Serialize Value where
   put = \case
     Object !o -> do
       putWord8 0
-      putMapOf put put (KM.toMap o)
+      put (VarLength (fromIntegral $ KM.size o))
+      void $ KM.traverseWithKey (\k v -> put k >> put v) o
     Array !v -> do
       putWord8 1
-      put (_VarLength . fromIntegral $ (V'.length v))
+      put (VarLength . fromIntegral $ (V'.length v))
       mapM_ put v
     Number !n ->
       either
@@ -45,13 +49,27 @@ instance Serialize Value where
 
   {-# INLINE get #-}
   get = getWord8 >>= \case
-    0 -> Object . KM.fromMap <$> getMapOf get get -- TODO, can we use same serialization
+    0 -> do  -- TODO, can we use same serialization
+      l <- fromEnum . _unVarLength <$> get @VarLength
+      let
+        constructM =
+          loop mempty l
+          where
+            loop !acc 0 = return acc
+            loop !acc !j = do
+              k <- get
+              v <- get
+              loop (KM.insert k v acc) (j-1)
+      Object <$> constructM
+
     1 -> do
       l <- fromEnum . _unVarLength <$> get @VarLength
       Array <$> V'.replicateM l get
+
     2 -> Number . fromFloatDigits <$> get @Double
     3 -> Number . fromIntegral <$> getInt64be
     4 -> String . T.decodeUtf8 <$> getLengthEncodedBS
     5 -> Bool <$> get
     6 -> return Null
     _ -> fail "Expected w8 less than 7"
+

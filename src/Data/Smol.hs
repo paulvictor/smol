@@ -36,7 +36,7 @@ import Control.Monad.Trans.State.Strict (runState, State)
 import Data.Ser (Ser, ser, Serializing, BufferWithLen(..))
 import qualified Data.Ser as Ser
 
--- bitmap is a vector of 256 bits
+-- bitmap is a vector of 64 bits
 newtype Bitmap = Bitmap { _unBitmap :: Word64 } deriving (Eq)
 
 instance Show Bitmap where
@@ -87,7 +87,7 @@ instance (Serialize k, Serialize v) => Serialize (LeafElem k v) where
   get = LeafElem <$> get <*> get
 instance (Ser k, Ser v) => Ser (LeafElem k v) where
   {-# INLINE ser #-}
-  ser (LeafElem {_k, _v}) = ser _k >> ser _v
+  ser (LeafElem {_k, _v}) = ser _k *> ser _v
 
 data HAMT k v
   = Internal
@@ -215,7 +215,7 @@ lookupHAMT key root = go 5 root
 data Smol (version :: Nat) = Smol
   { _lookupBuffer :: !ByteString
   , _leavesCount :: !Word32
-  , _leavesBuffer :: !ByteString }
+  , _leavesBuffer :: !ByteString } deriving (Show)
 
 $(makeLenses ''Smol)
 
@@ -269,11 +269,9 @@ serializeHAMT !hamt =
   go :: HAMT k v -> State S Serializing
   go = \case
     node@(Leaf _) -> do
-      o <- use offset
+      i <- use (offset._Wrapped' @(Sum Int))
       let
-        serializedLeaf = Ser.word8 1 >> ser o
---         serializedLeaf = runPut $
---           putWord8 1 >> put o
+        serializedLeaf = Ser.word8 1 *> Ser.varLength i
         (BufferWithLen buf l) = Ser.runSerializing $ ser (node ^. values)
       leavesBuilder <>= buf
       count += 1
@@ -288,21 +286,21 @@ serializeHAMT !hamt =
         _ :|> maxOffset = offsets
         (offsetsSer, !numWordsPerOffset) =
           if maxOffset < (fromEnum (maxBound @Word8))
-          then (mapM_ (Ser.word8 . toEnum) offsets, 1)
+          then (traverse_ (Ser.word8 . toEnum) offsets, 1)
           else if maxOffset < (fromEnum (maxBound @Word16))
-          then (mapM_ (Ser.word16BE . toEnum) offsets, 2)
+          then (traverse_ (Ser.word16BE . toEnum) offsets, 2)
           else if maxOffset < (fromEnum (maxBound @Word32))
-          then (mapM_ (Ser.word32BE . toEnum) offsets, 4)
-          else (mapM_ (Ser.word64BE . toEnum) offsets, 8)
+          then (traverse_ (Ser.word32BE . toEnum) offsets, 4)
+          else (traverse_ (Ser.word64BE . toEnum) offsets, 8)
 
         serializedNode =
-          Ser.word8 0 >>
+          Ser.word8 0 *>
           Ser.nested
             (Ser.word16BE . toEnum)
-            (ser _bitmap >>
-             Ser.word8 numWordsPerOffset >>
-             offsetsSer) >>
-          sequence_ serializedChildren
+            (ser _bitmap *>
+             Ser.word8 numWordsPerOffset *>
+             offsetsSer) *>
+          sequenceA_ serializedChildren
       return $! serializedNode
 
 deserializeHAMT :: forall k v. (Serialize k, Serialize v) => Smol 1 -> Either String [(k, v)]
@@ -367,12 +365,6 @@ getFromSize sizeOfOffset =
   else if sizeOfOffset == 4
   then getWord32be <&> fromIntegral
   else getWord64be <&> fromIntegral
-
--- {-# INLINE putListOf' #-}
--- putListOf' :: Putter a -> Putter [a]
--- putListOf' pa xs =
---   put (_VarLength (fromIntegral $ length xs)) >>
---   mapM_ pa xs
 
 {-# INLINE getListOf' #-}
 getListOf' :: Get a -> Get [a]

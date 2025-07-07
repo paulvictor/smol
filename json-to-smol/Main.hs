@@ -36,8 +36,8 @@ hush = either (const Nothing) Just
 
 main :: IO ()
 main =
-  convert
---   execParser (info optionsParser mempty) >>= lookup_
+--   convert
+  execParser (info optionsParser mempty) >>= lookup_
 
 lookup_ :: [Key] -> IO ()
 lookup_ keys =
