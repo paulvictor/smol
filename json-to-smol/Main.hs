@@ -13,6 +13,7 @@ import qualified Data.Conduit.List as C (mapMaybe)
 import Data.Aeson
 import Data.Smol
 import Data.Smol.JSON
+import Data.Aeson.KeyMap (KeyMap)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Serialize as Ser
 import Data.Serialize (get)
@@ -47,7 +48,7 @@ lookup_ keys =
     .| conduitGet2 get
     .| C.map (\smol1 -> KM.fromList (keys <&> (\key -> (key, join $ hush (lookupEncodedHamt @Key @Value key smol1)))))
     .| C.map encode
-    .| C.mapM_ (LBS.putStrLn)
+    .| C.mapM_ LBS.putStrLn
 
 convert :: IO ()
 convert =
@@ -55,9 +56,8 @@ convert =
     stdin
     .| Zstd.decompress
     .| linesUnboundedAscii
-    .| C.mapMaybe (decodeStrict @Object)
-    .| C.map (fromKVPairs . KM.toList)
-    .| C.map trimHAMT
+    .| C.mapMaybe (decodeStrict @(KeyMap Value))
+    .| C.map (trimHAMT . fromHashMap . KM.toHashMap)
     .| C.map (Ser.encode . serializeHAMT)
     .| Zstd.compress 4
     .| stdout

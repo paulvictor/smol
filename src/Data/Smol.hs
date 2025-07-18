@@ -8,14 +8,15 @@ module Data.Smol
   , LeafElem(..)
   , HAMT(..)
   , Smol(..)
-  , fromKVPairs ) where
+  , fromKVPairs
+  , fromHashMap ) where
 
+import Data.Bitmap
 import Data.Monoid
 import Data.Word
 import Data.Serialize
 import Control.Lens.Operators
 import Control.Lens.Combinators
-import Numeric.Lens
 import Data.Bits
 import Data.Hashable
 import Data.ByteString (ByteString)
@@ -35,48 +36,19 @@ import Control.Monad
 import Control.Monad.Trans.State.Strict (runState, State)
 import Data.Ser (Ser, ser, Serializing, BufferWithLen(..))
 import qualified Data.Ser as Ser
+import qualified Data.HashMap.Strict as HM
+import Data.HashMap.Strict (HashMap)
+import Debug.Trace
 
--- bitmap is a vector of 64 bits
-newtype Bitmap = Bitmap { _unBitmap :: Word64 } deriving (Eq)
-
-instance Show Bitmap where
-  show (Bitmap bm) =
-    "Ox" <> (bm ^. re hex)
-
-instance Serialize Bitmap where
-  {-# INLINE put #-}
-  put (Bitmap bm) = putWord64be bm
-  get = Bitmap <$> getWord64be
-
-instance Ser Bitmap where
-  ser (Bitmap bm) = ser bm
-
-{-# INLINE emptyBM #-}
-emptyBM :: Bitmap
-emptyBM = Bitmap zeroBits
-
-{-# INLINE setBitBM #-}
-setBitBM :: Word8 -> Bitmap -> Bitmap
-setBitBM i (Bitmap bm) = Bitmap $ setBit bm (fromEnum i)
-
-{-# INLINE checkBit #-}
-checkBit :: Bitmap -> Word8 -> Bool
-checkBit (Bitmap bm) i = testBit bm (fromEnum i)
-
-{-# INLINE popCountToRightOf #-}
-popCountToRightOf :: Word8 -> Bitmap -> Int
-popCountToRightOf pos (Bitmap bm) =
-  let
-    bitMask = (1 `shiftL` fromEnum pos) - 1
-  in
-    popCount $ bitMask .&. bm
-
+data List a where
+  Nil :: List a
+  Cons :: !a -> !(List a) -> List a
 -- Used for construction
 data LeafElem k v =
   LeafElem
   {
     _k :: !k
-  , _v :: v
+  , _v :: !v
   } deriving (Eq, Show, Functor, Foldable, Traversable)
 $(makeLenses ''LeafElem)
 
@@ -125,6 +97,11 @@ trimHAMT = \case
       if Seq.length (node ^. orderedChildren) == 1 && has _Leaf firstTrimmed
       then firstTrimmed
       else nodeWithTrimmedChildren
+
+{-# INLINE fromHashMap #-}
+fromHashMap :: (Serialize k, Serialize v, Hashable k) => HashMap k v -> HAMT k v
+fromHashMap =
+  HM.foldlWithKey' (\(!prev) !k !v -> consHAMT k v prev) (empty 5)
 
 {-# INLINE fromKVPairs #-}
 fromKVPairs :: (Foldable t, Serialize k, Serialize v, Hashable k) => t (k, v) -> HAMT k v
@@ -284,7 +261,7 @@ serializeHAMT !hamt =
           Seq.scanl (+) 0 $
             getSum . Ser._length . Ser.runSerializing <$> serializedChildren
         _ :|> maxOffset = offsets
-        (offsetsSer, !numWordsPerOffset) =
+        (offsetsSer, numWordsPerOffset) =
           if maxOffset < (fromEnum (maxBound @Word8))
           then (traverse_ (Ser.word8 . toEnum) offsets, 1)
           else if maxOffset < (fromEnum (maxBound @Word16))
@@ -298,8 +275,7 @@ serializeHAMT !hamt =
           Ser.nested
             (Ser.word16BE . toEnum)
             (ser _bitmap *>
-             Ser.word8 numWordsPerOffset *>
-             offsetsSer) *>
+             traverse_ (Ser.word16BE . toEnum) offsets) *>
           sequenceA_ serializedChildren
       return $! serializedNode
 
@@ -309,7 +285,7 @@ deserializeHAMT (Smol {_leavesCount, _leavesBuffer}) =
     (replicateM (fromIntegral _leavesCount) (getListOf' get))
     _leavesBuffer
   <&> concat
-  <&> fmap (\(LeafElem k v)  -> (k, v))
+  <&> fmap (\(LeafElem _k _v)  -> (_k, _v))
 
 {-# INLINE lookupEncodedHamt #-}
 lookupEncodedHamt :: (Eq k, Hashable k, Serialize k, Serialize v) => k -> Smol 1 -> Either String (Maybe v)
@@ -338,21 +314,21 @@ lookupEncodedHamt !key !smol =
         getOffset = do
           uncheckedSkip (sizeOf (undefined :: Word16)) -- 2 bytes indicating the size of this block
           !bm <- get
-          !sizeOfOffset <- fromEnum <$> getWord8
+--           !sizeOfOffset <- fromEnum <$> getWord8
           let
             !isChildPresent = checkBit bm idxIntoBitmap
-            offset = popCountToRightOf idxIntoBitmap bm
+            _offset = popCountToRightOf idxIntoBitmap bm
           if isChildPresent
           then -- get the offset
-            uncheckedSkip (offset * sizeOfOffset) >>
-            Just <$> getFromSize sizeOfOffset
+            uncheckedSkip (_offset * (sizeOf (undefined :: Word16))) >>
+            Just . fromIntegral <$> getWord16be
           else return Nothing
       in lookAhead getOffset >>=
         maybe
           (return Nothing)
-          (\(!offset) -> do
+          (\(!_offset) -> do
             getWord16be >>= uncheckedSkip . fromEnum -- UncheckedSkip this block
-            uncheckedSkip (fromEnum offset) >> go nextLevel)
+            uncheckedSkip (fromEnum _offset) >> go nextLevel)
     _ -> fail "Cannot match a leaf or an internal node"
 
 {-# INLINE getFromSize #-}
@@ -374,11 +350,11 @@ getListOf' g = do
 
 {-# INLINE findGet #-}
 findGet :: (a -> Bool) -> Get a -> Get (Maybe a)
-findGet pred g = do
+findGet predicate g = do
   !l <- fromEnum . _unVarLength <$> getVarLength
   loop l
   where
     loop 0 = return Nothing
     loop !i = do
       !a <- g
-      if pred a then return (Just a) else loop (i-1)
+      if predicate a then return (Just a) else loop (i-1)

@@ -71,7 +71,8 @@ library
       , RecordWildCards
 
     -- Modules included in this library but not exported.
---     other-modules:
+    other-modules:
+      Data.Bitmap
 --       Data.VarLength
 
     -- LANGUAGE extensions used by modules in this package.
