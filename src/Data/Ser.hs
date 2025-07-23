@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE LambdaCase #-}
 module Data.Ser where
 
 import Data.Scientific (floatingOrInteger)

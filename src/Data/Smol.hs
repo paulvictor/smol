@@ -1,4 +1,9 @@
 {-# LANGUAGE OverloadedLists #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleInstances #-}
 module Data.Smol
   ( lookupEncodedHamt
   , trimHAMT

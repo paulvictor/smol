@@ -69,6 +69,12 @@ library
         TemplateHaskell
       , OverloadedStrings
       , RecordWildCards
+      , BangPatterns
+      , ScopedTypeVariables
+      , TypeApplications
+      , LambdaCase
+      , NamedFieldPuns
+
 
     -- Modules included in this library but not exported.
     other-modules:
